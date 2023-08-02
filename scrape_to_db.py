@@ -2,9 +2,8 @@ import json
 import time
 import pymongo
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from multiprocessing import get_context
+from multiprocessing import get_context, Pool
 import sys
-import re
 from datetime import datetime
 
 '''
@@ -14,15 +13,16 @@ the multiprocessing_logging package only works with forks, but pymongo connectio
 (thus I use 'spawn' for the context)
 '''
 
+# set stdout to a file automatically named by date
 sys.stdout = open("scrape_to_db" + datetime.now().strftime("%m%d") + ".out", "a")
-rm = re.compile(r'\n+')
+
 
 def scrape_descr(job_ids: list):
     with sync_playwright() as p:
-        browser = p.firefox.launch()
+        browser = p.firefox.launch() # launch(headless=False, slow_mo=500) for debugging
         cont = browser.new_context(record_har_content="omit")
         page = cont.new_page()
-        total = []
+        total = [] # list to collect all data this chunk returns
         chunkn = job_ids[1]
         job_ids = job_ids[0]
 
@@ -34,24 +34,19 @@ def scrape_descr(job_ids: list):
             else:
                 rt.continue_()
 
-        def go_to(url):
+        def go_to(url):  # goto is wrapped in this function so a timeout will attempt to reload instead of giving up
             nonlocal page
             while True:
                 try:
-                    page.goto(url, timeout=30000)
+                    page.goto(url, timeout=30000, wait_until="load")
                 except PlaywrightTimeoutError:
                     print(f"Chunk {chunkn}: Timeout error to {url}, attempting reload...", flush=True)
                     continue
                 break
 
-        def clean_text(text):
-            text = text.replace("&amp;", "&")
-            return re.sub(rm, "", text)
-
         def scrape(job_id):
             nonlocal page
             go_to(f'https://www.indeed.com/viewjob?jk={job_id}')
-            page.wait_for_load_state("load")
             t1 = time.time()
             while "Just a moment" in page.title():  # sometimes navigation takes a while and I get this middle page
                 time.sleep(0.1)
@@ -81,18 +76,16 @@ def scrape_descr(job_ids: list):
             loc = loc.inner_text()
             text = page.query_selector('//div[@id="jobDescriptionText"]')
             body = text.inner_html()
-            body = clean_text(body)
-            return {"_id": job_id, "occ": occ, "org": org, "loc": loc, "descr": body}
+            if len(body) < 20000:
+                return {"_id": job_id, "occ": occ, "org": org, "loc": loc, "descr": body}
 
         page.route("", block_requests)
         for num in range(0, len(job_ids)):
             res = scrape(job_ids[num])
             if res:
                 total.append(res)
-            if num % 20 == 0 and num != 0:
+            if num % 25 == 0 and num >= 25:  # restart context every 25 pages to avoid bot defenses
                 cont.close()
-                browser.close()
-                browser = p.firefox.launch()
                 cont = browser.new_context(record_har_content="omit")
                 page = cont.new_page()
                 page.route("", block_requests)
@@ -103,32 +96,48 @@ def scrape_descr(job_ids: list):
 
 
 if __name__ == '__main__':
-    with open('job_ids.json', 'r') as f:
+    with open('../job_ids2_453491.json', 'r') as f:  # newly scraped job ids
         ids = json.load(f)
         ids = list(ids.keys())
     f.close()
-    chunks = list(range(0, len(ids), 500))  # split ids into chunks to send to each process
+    chunks = list(range(0, len(ids), 1000))  # split ids into chunks to send to each process
     i = 0
     id_inds = [[x] for x in range(0, len(chunks))]  # assign each chunk a number for logging
     while i < len(chunks) - 1:
         id_inds[i] = [ids[chunks[i]:chunks[i + 1]], i + 1]
         i += 1
     id_inds[i] = [ids[chunks[i]:], i]
-    # program crashed after adding chunk 309 to db, restart from there
-    id_inds = [id_inds[334], id_inds[394], id_inds[407]]
-    # print(f"{len(id_inds)} chunks, starting from {id_inds[0][1]}, remain to be scraped.")
-
     mclient = pymongo.MongoClient()
     db = mclient.job_data_db
-    descriptions = db.posts
+    descriptions = db.big_jobs
 
+    '''
+    this is the section where a pool of workers take chunks of ids, scrape the data, and insert them into the mongodb
+    the pool was terminating before any results were inserted due to an 'invalid state' error
+    likely caused by the playwright firefox browser connection error
+    so the following part is similar code that runs sequentially instead of using a processing pool
+    '''
     with get_context('spawn').Pool(3) as pool:
         for results in pool.imap_unordered(scrape_descr, id_inds):
             try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
                 out = descriptions.insert_many(results, ordered=False)
+                print(out)
             except pymongo.errors.BulkWriteError as e:
                 print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
-    pool.close()
-    pool.terminate()
     print("Multiprocess context complete.")
+
+    '''
+    this section was to test if the scraping would work sequentially
+    but no
+    it doesn't
+    it's still playwright's firefox browser connection error
+    and I can't use chromium or webkit browsers because they trigger bot defenses
+    '''
+    for results in map(scrape_descr, id_inds):
+        try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
+            out = descriptions.insert_many(results, ordered=False)
+            print(out)
+        except pymongo.errors.BulkWriteError as e:
+            print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
+    # turns out multiprocess wasn't the issue, it's still the playwright firefox connection causing errors! argh!
     mclient.close()
