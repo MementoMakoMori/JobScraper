@@ -19,7 +19,7 @@ sys.stdout = open("scrape_to_db" + datetime.now().strftime("%m%d") + ".out", "a"
 
 def scrape_descr(job_ids: list):
     with sync_playwright() as p:
-        browser = p.firefox.launch() # launch(headless=False, slow_mo=500) for debugging
+        browser = p.firefox.launch()  # launch(headless=False, slow_mo=500) for debugging
         cont = browser.new_context(record_har_content="omit")
         page = cont.new_page()
         total = [] # list to collect all data this chunk returns
@@ -100,7 +100,7 @@ if __name__ == '__main__':
         ids = json.load(f)
         ids = list(ids.keys())
     f.close()
-    chunks = list(range(0, len(ids), 1000))  # split ids into chunks to send to each process
+    chunks = list(range(0, len(ids), 500))  # split ids into chunks to send to each process
     i = 0
     id_inds = [[x] for x in range(0, len(chunks))]  # assign each chunk a number for logging
     while i < len(chunks) - 1:
@@ -117,14 +117,14 @@ if __name__ == '__main__':
     likely caused by the playwright firefox browser connection error
     so the following part is similar code that runs sequentially instead of using a processing pool
     '''
-    with get_context('spawn').Pool(3) as pool:
-        for results in pool.imap_unordered(scrape_descr, id_inds):
-            try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
-                out = descriptions.insert_many(results, ordered=False)
-                print(out)
-            except pymongo.errors.BulkWriteError as e:
-                print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
-    print("Multiprocess context complete.")
+    # with get_context('spawn').Pool(3) as pool:
+    #     for results in pool.imap_unordered(scrape_descr, id_inds):
+    #         try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
+    #             out = descriptions.insert_many(results, ordered=False)
+    #             print(out)
+    #         except pymongo.errors.BulkWriteError as e:
+    #             print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
+    # print("Multiprocess context complete.")
 
     '''
     this section was to test if the scraping would work sequentially
@@ -134,10 +134,11 @@ if __name__ == '__main__':
     and I can't use chromium or webkit browsers because they trigger bot defenses
     '''
     for results in map(scrape_descr, id_inds):
-        try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
-            out = descriptions.insert_many(results, ordered=False)
-            print(out)
-        except pymongo.errors.BulkWriteError as e:
-            print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
+        print(f'Returned {len(results)}.', flush=True)
+        # try:  # when restarting after a disconnection crash, inserts may be repeated. catch & ignore them.
+        #     out = descriptions.insert_many(results, ordered=False)
+        #     print(out)
+        # except pymongo.errors.BulkWriteError as e:
+        #     print(f"ID {e.details['writeErrors'][0]['keyValue']['_id']} skipped as it is already in db.")
     # turns out multiprocess wasn't the issue, it's still the playwright firefox connection causing errors! argh!
     mclient.close()
